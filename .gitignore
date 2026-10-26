@@ -1,0 +1,19 @@
+# Secrets & Environment
+.env
+*.session
+*.session-journal
+
+# Runtime Data & Student Profiles
+data/
+
+# Python Bytecode & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# Logs & OS Files
+*.log
+.DS_Store
+Thumbs.db
