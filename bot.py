@@ -189,11 +189,34 @@ def split_chat_and_docx_parts(raw_text: str) -> tuple[str, str]:
     return chat_part, docx_part
 
 
+async def safe_send_action(update: Update, action: str = ChatAction.TYPING):
+    """Gửi trạng thái 'đang gõ...' an toàn: nếu kết nối cũ vừa thức dậy bị ngắt (ReadError), bỏ qua ngay mà không làm gián đoạn việc trả lời."""
+    for _ in range(2):
+        try:
+            await update.message.chat.send_action(action=action)
+            return
+        except Exception:
+            await asyncio.sleep(0.2)
+
+
+async def safe_reply_text(update: Update, text: str, **kwargs):
+    """Gửi tin nhắn văn bản với cơ chế tự động thử lại ngay nếu socket cũ bị đóng sau thời gian nghỉ (httpx.ReadError / NetworkError)."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            return await update.message.reply_text(text, **kwargs)
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Thử lại gửi tin nhắn (lần {attempt+1}/3) do lỗi mạng tạm thời: {e}")
+            await asyncio.sleep(0.4 * (attempt + 1))
+    raise last_err
+
+
 async def send_long_message(update: Update, text: str):
     """Chia nhỏ tin nhắn nếu vượt quá giới hạn 4096 ký tự của Telegram."""
     max_len = 4000
     if len(text) <= max_len:
-        await update.message.reply_text(text)
+        await safe_reply_text(update, text)
         return
 
     chunks = []
@@ -208,7 +231,7 @@ async def send_long_message(update: Update, text: str):
         chunks.append(current)
 
     for chunk in chunks:
-        await update.message.reply_text(chunk)
+        await safe_reply_text(update, chunk)
 
 
 async def export_and_send_docx(update: Update, markdown_text: str, filename_prefix: str = "Cham_Bai_Tieng_Duc_Kon"):
@@ -217,17 +240,24 @@ async def export_and_send_docx(update: Update, markdown_text: str, filename_pref
     out_file = TEMP_DIR / f"{filename_prefix}_{user_id}_{timestamp}.docx"
 
     try:
-        await update.message.chat.send_action(action=ChatAction.UPLOAD_DOCUMENT)
+        await safe_send_action(update, action=ChatAction.UPLOAD_DOCUMENT)
         await asyncio.to_thread(markdown_to_docx, markdown_text, out_file)
-        with open(out_file, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"{filename_prefix}.docx",
-                caption="📄 Em đã đóng gói kết quả chấm bài chi tiết kèm Meme/GIF vào file Word (.docx) ở đây ạ 🤓!",
-            )
+        for attempt in range(3):
+            try:
+                with open(out_file, "rb") as f:
+                    await update.message.reply_document(
+                        document=f,
+                        filename=f"{filename_prefix}.docx",
+                        caption="📄 Em đã đóng gói kết quả chấm bài chi tiết kèm Meme/GIF vào file Word (.docx) ở đây ạ 🤓!",
+                    )
+                break
+            except Exception as doc_err:
+                if attempt == 2:
+                    raise doc_err
+                await asyncio.sleep(0.5)
     except Exception as e:
         logger.error(f"Lỗi xuất DOCX: {e}")
-        await update.message.reply_text(f"⚠️ Có lỗi nhỏ khi đóng gói file Word: {e}")
+        await safe_reply_text(update, f"⚠️ Có lỗi nhỏ khi đóng gói file Word: {e}")
     finally:
         try:
             if out_file.exists():
@@ -284,7 +314,8 @@ async def check_access_or_unlock(update: Update, context: ContextTypes.DEFAULT_T
 
     if msg_text and msg_text.lower() == current_pass.lower():
         authorize_user(user.id, user.full_name or user.first_name or "Người dùng", user.username or "")
-        await update.message.reply_text(
+        await safe_reply_text(
+            update,
             f"✅ **Mở khóa thành công!** Chào mừng **{user.first_name or 'bạn'}** sử dụng **Kon German Bot** 🤓.\n\n"
             "Bây giờ bạn có thể gửi trực tiếp:\n"
             "• 🎙️ Video / Ghi âm bài nói tiếng Đức (Sprechen)\n"
@@ -305,7 +336,8 @@ async def check_access_or_unlock(update: Update, context: ContextTypes.DEFAULT_T
             pass
         return False
 
-    await update.message.reply_text(
+    await safe_reply_text(
+        update,
         "🔒 **Kon German Bot — Chế độ Nội bộ!**\n\n"
         "Bạn chưa được mở khóa quyền sử dụng bot này. "
         "Vui lòng nhắn **Mật khẩu mở khóa** do Admin cấp vào đây (chỉ cần nhập 1 lần duy nhất) nhé 🤓!"
@@ -315,7 +347,7 @@ async def check_access_or_unlock(update: Update, context: ContextTypes.DEFAULT_T
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
+        await safe_reply_text(update, "⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
         return
     users = list_authorized_users()
     cur_pass = get_passcode()
@@ -329,40 +361,41 @@ async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = f" (@{info['username']})" if info.get("username") else ""
         lines.append(f"• {role_badge}: **{info.get('name')}**{uname} — ID: `{uid}` (Từ: {info.get('joined_at', '')})")
     lines.append("\n💡 *Để xóa quyền 1 người, gõ:* `/revoke <ID>`")
-    await update.message.reply_text("\n".join(lines))
+    await safe_reply_text(update, "\n".join(lines))
 
 
 async def setpass_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
+        await safe_reply_text(update, "⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
         return
     if not context.args:
-        await update.message.reply_text(
+        await safe_reply_text(
+            update,
             f"🔑 Mật khẩu mở khóa hiện tại là: `{get_passcode()}`\n"
             "Để đổi mật khẩu mới, hãy gõ: `/setpass <mật_khẩu_mới>` (VD: `/setpass dmf2026`)"
         )
         return
     new_pass = context.args[0].strip()
     set_passcode(new_pass)
-    await update.message.reply_text(f"✅ Đã đổi mật khẩu mở khóa Bot thành: `{new_pass}`")
+    await safe_reply_text(update, f"✅ Đã đổi mật khẩu mở khóa Bot thành: `{new_pass}`")
 
 
 async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
+        await safe_reply_text(update, "⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
         return
     if not context.args:
-        await update.message.reply_text("⚠️ Vui lòng nhập ID người dùng cần thu hồi quyền. VD: `/revoke 123456789` (Xem ID bằng lệnh `/users`).")
+        await safe_reply_text(update, "⚠️ Vui lòng nhập ID người dùng cần thu hồi quyền. VD: `/revoke 123456789` (Xem ID bằng lệnh `/users`).")
         return
     target_id = context.args[0].strip()
     if not target_id.isdigit():
-        await update.message.reply_text("⚠️ ID người dùng phải là dãy số!")
+        await safe_reply_text(update, "⚠️ ID người dùng phải là dãy số!")
         return
     ok = revoke_user(int(target_id))
     if ok:
-        await update.message.reply_text(f"✅ Đã thu hồi quyền sử dụng Bot của ID `{target_id}`!")
+        await safe_reply_text(update, f"✅ Đã thu hồi quyền sử dụng Bot của ID `{target_id}`!")
     else:
-        await update.message.reply_text(f"⚠️ Không tìm thấy ID `{target_id}` trong danh sách hoặc không thể xóa Admin.")
+        await safe_reply_text(update, f"⚠️ Không tìm thấy ID `{target_id}` trong danh sách hoặc không thể xóa Admin.")
 
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
@@ -388,7 +421,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/clear` — Xóa bộ nhớ đệm hội thoại\n"
         "• `/help` — Xem hướng dẫn chi tiết"
     )
-    await update.message.reply_text(msg)
+    await safe_reply_text(update, msg)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,7 +443,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   • `/docx` — Tạo file Word từ câu trả lời/bài chấm gần nhất\n"
         "   • `/clear` — Làm mới phiên trò chuyện"
     )
-    await update.message.reply_text(msg)
+    await safe_reply_text(update, msg)
 
 
 async def profile_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -425,7 +458,8 @@ async def setlevel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         state = load_student_state(user.id)
         cur = state.get("target_level", "B1")
-        await update.message.reply_text(
+        await safe_reply_text(
+            update,
             f"🎯 Trình độ mục tiêu hiện tại đang là: **{cur}**.\n"
             "Để đổi trình độ, hãy gõ: `/setlevel B1` (Hỗ trợ: A1, A2, B1, B2, C1, C2)."
         )
@@ -433,11 +467,11 @@ async def setlevel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lvl = context.args[0].upper().strip()
     if lvl not in valid_levels:
-        await update.message.reply_text("⚠️ Trình độ không hợp lệ! Vui lòng chọn một trong các mức: A1, A2, B1, B2, C1, C2.")
+        await safe_reply_text(update, "⚠️ Trình độ không hợp lệ! Vui lòng chọn một trong các mức: A1, A2, B1, B2, C1, C2.")
         return
 
     set_student_level(user.id, lvl, name=user.first_name or "Học viên")
-    await update.message.reply_text(f"✅ Đã cập nhật mục tiêu giảng dạy & chấm bài sang trình độ **Goethe {lvl}** 🤓!")
+    await safe_reply_text(update, f"✅ Đã cập nhật mục tiêu giảng dạy & chấm bài sang trình độ **Goethe {lvl}** 🤓!")
 
 
 async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -445,7 +479,7 @@ async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_student_state(user.id)
     state["history"] = []
     save_student_state(user.id, state)
-    await update.message.reply_text("🧹 Đã dọn sạch bộ nhớ đệm cuộc trò chuyện! (Hồ sơ học tập dài hạn của bạn vẫn được giữ nguyên 🤓).")
+    await safe_reply_text(update, "🧹 Đã dọn sạch bộ nhớ đệm cuộc trò chuyện! (Hồ sơ học tập dài hạn của bạn vẫn được giữ nguyên 🤓).")
 
 
 async def docx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -453,7 +487,7 @@ async def docx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = load_student_state(user.id)
     md_text = state.get("last_grading_markdown") or state.get("last_response_markdown")
     if not md_text:
-        await update.message.reply_text("⚠️ Chưa có bài chấm hoặc bài giảng nào gần đây để xuất file Word. Hãy gửi bài viết, ảnh chụp hoặc ghi âm trước nhé!")
+        await safe_reply_text(update, "⚠️ Chưa có bài chấm hoặc bài giảng nào gần đây để xuất file Word. Hãy gửi bài viết, ảnh chụp hoặc ghi âm trước nhé!")
         return
 
     await export_and_send_docx(update, md_text)
@@ -469,7 +503,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
-    await update.message.chat.send_action(action=ChatAction.TYPING)
+    await safe_send_action(update, action=ChatAction.TYPING)
     user_name = user.first_name or "Ông chủ"
     state = load_student_state(user.id)
     sys_instruction = build_system_instruction(user.id, user_name, extra_text=user_text)
@@ -495,7 +529,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_text = (response.text or "Ủa tự nhiên não em lag ngang, thử hỏi lại giúp em nhé 🤓!").strip()
     except Exception as e:
         logger.error(f"Gemini error: {e}")
-        await update.message.reply_text(f"⚠️ Lỗi kết nối AI: {e}")
+        await safe_reply_text(update, f"⚠️ Lỗi kết nối AI: {e}")
         return
 
     grading_detected = is_grading_response(reply_text)
@@ -518,8 +552,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_speaking_audio(update: Update, audio_path: Path, mime_type: str = "audio/ogg", caption: str = ""):
     user = update.effective_user
     user_name = user.first_name or "Ông chủ"
-    await update.message.chat.send_action(action=ChatAction.TYPING)
-    status_msg = await update.message.reply_text(
+    await safe_send_action(update, action=ChatAction.TYPING)
+    status_msg = await safe_reply_text(
+        update,
         "🎧 Đang tách âm thanh & nghe kỹ từng âm tiết tiếng Đức để chấm phát âm / Sprechen, đợi em vài giây nhé 🤓..."
     )
 
@@ -567,7 +602,7 @@ async def process_speaking_audio(update: Update, audio_path: Path, mime_type: st
             await export_and_send_docx(update, reply_text, filename_prefix="Cham_Bai_Noi_Sprechen_Kon")
     except Exception as e:
         logger.error(f"Lỗi xử lý ghi âm: {e}")
-        await update.message.reply_text(f"⚠️ Lỗi khi nghe và chấm file ghi âm: {e}")
+        await safe_reply_text(update, f"⚠️ Lỗi khi nghe và chấm file ghi âm: {e}")
     finally:
         for p in {audio_path, prepared_path}:
             try:
@@ -618,7 +653,8 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
         err_str = str(e)
         if "File is too big" in err_str or size_mb > 19.5:
             logger.info(f"File {size_mb:.1f} MB vượt ngưỡng 20MB HTTP API, chuyển sang tải qua MTProto...")
-            mtproto_msg = await update.message.reply_text(
+            mtproto_msg = await safe_reply_text(
+                update,
                 f"📥 Video khá nặng (**{size_mb:.1f} MB** > 20 MB), em đang bật luồng tải tốc độ cao MTProto để lấy video và tách âm thanh, đợi em khoảng 15–30 giây nhé 🤓..."
             )
             try:
@@ -630,7 +666,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             except Exception as mt_err:
                 logger.error(f"Lỗi tải MTProto: {mt_err}")
-                await update.message.reply_text(f"⚠️ Lỗi khi tải video dung lượng lớn: {mt_err}")
+                await safe_reply_text(update, f"⚠️ Lỗi khi tải video dung lượng lớn: {mt_err}")
                 return
             finally:
                 try:
@@ -639,7 +675,7 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
                     pass
         else:
             logger.error(f"Lỗi tải file voice/video ({size_mb:.1f} MB): {e}")
-            await update.message.reply_text(f"⚠️ Lỗi khi tải file ghi âm/video từ Telegram: {e}")
+            await safe_reply_text(update, f"⚠️ Lỗi khi tải file ghi âm/video từ Telegram: {e}")
             return
 
     await process_speaking_audio(update, temp_audio, mime_type=mime_type, caption=caption)
@@ -648,10 +684,11 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
 async def process_handwriting_images(update: Update, image_paths: list[Path], caption: str = ""):
     user = update.effective_user
     user_name = user.first_name or "Ông chủ"
-    await update.message.chat.send_action(action=ChatAction.TYPING)
+    await safe_send_action(update, action=ChatAction.TYPING)
     page_count = len(image_paths)
     page_label = f"{page_count} trang chữ viết tay" if page_count > 1 else "chữ viết tay"
-    status_msg = await update.message.reply_text(
+    status_msg = await safe_reply_text(
+        update,
         f"🔍 Đang bật Kính lúp kép soi {page_label} (lọc chữ gạch xóa & chấm chuẩn Schreiben B1), đợi em vài giây nhé 🤓..."
     )
 
@@ -715,7 +752,7 @@ async def process_handwriting_images(update: Update, image_paths: list[Path], ca
         await export_and_send_docx(update, docx_part, filename_prefix="Cham_Bai_Viet_Tay_Kon")
     except Exception as e:
         logger.error(f"Lỗi xử lý ảnh viết tay: {e}")
-        await update.message.reply_text(f"⚠️ Lỗi khi nhận diện và chấm ảnh bài tập: {e}")
+        await safe_reply_text(update, f"⚠️ Lỗi khi nhận diện và chấm ảnh bài tập: {e}")
     finally:
         for p in list(image_paths) + enhanced_paths:
             try:
@@ -782,7 +819,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as dl_err:
             if "File is too big" in str(dl_err):
                 size_mb = (doc.file_size or 0) / (1024 * 1024)
-                mt_msg = await update.message.reply_text(
+                mt_msg = await safe_reply_text(
+                    update,
                     f"📥 File `{file_name}` khá nặng (**{size_mb:.1f} MB** > 20 MB), em đang tải qua luồng MTProto tốc độ cao, đợi em 15–30 giây nhé 🤓..."
                 )
                 try:
@@ -809,10 +847,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if suffix == ".docx":
-            await update.message.chat.send_action(action=ChatAction.TYPING)
+            await safe_send_action(update, action=ChatAction.TYPING)
             extracted_text = await asyncio.to_thread(read_docx_text, temp_path)
             if not extracted_text:
-                await update.message.reply_text("⚠️ File Word (.docx) này trống hoặc không có văn bản đọc được ạ!")
+                await safe_reply_text(update, "⚠️ File Word (.docx) này trống hoặc không có văn bản đọc được ạ!")
                 return
 
             user = update.effective_user
@@ -843,13 +881,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await export_and_send_docx(update, docx_part, filename_prefix=f"Kon_Cham_{Path(file_name).stem}")
             return
 
-        await update.message.reply_text(
+        await safe_reply_text(
+            update,
             "⚠️ Hiện tại em hỗ trợ trực tiếp: **Ghi âm giọng nói (.ogg, .m4a, .mp3, .wav, .mp4)**, **File Word (.docx)** và **Ảnh chụp bài tập (.jpg, .png)**. "
             "Bạn vui lòng gửi đúng định dạng nhé 🤓!"
         )
     except Exception as e:
         logger.error(f"Lỗi xử lý tài liệu: {e}")
-        await update.message.reply_text(f"⚠️ Có lỗi khi đọc file `{file_name}`: {e}")
+        await safe_reply_text(update, f"⚠️ Có lỗi khi đọc file `{file_name}`: {e}")
     finally:
         if suffix not in {".jpg", ".jpeg", ".png", ".webp"} and suffix not in AUDIO_MIME_MAP:
             try:
