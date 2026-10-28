@@ -933,6 +933,13 @@ def _ensure_single_instance():
 
 
 def main():
+    import sys
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
     if not TELEGRAM_BOT_TOKEN:
         print("LỖI: Chưa cấu hình TELEGRAM_BOT_TOKEN trong file .env!")
         return
@@ -978,7 +985,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
