@@ -12,8 +12,11 @@ _DNS_CACHE = {}
 
 def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     cache_key = (host, port, type, proto)
+    if cache_key in _DNS_CACHE:
+        return _DNS_CACHE[cache_key]
     try:
-        res = _orig_getaddrinfo(host, port, family, type, proto, flags)
+        target_family = socket.AF_INET if family == 0 else family
+        res = _orig_getaddrinfo(host, port, target_family, type, proto, flags)
         ipv4 = [r for r in res if r[0] == socket.AF_INET]
         result = ipv4 if ipv4 else res
         if result:
@@ -22,7 +25,8 @@ def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     except socket.gaierror:
         if cache_key in _DNS_CACHE:
             return _DNS_CACHE[cache_key]
-        raise
+        res = _orig_getaddrinfo(host, port, family, type, proto, flags)
+        return res
 
 
 socket.getaddrinfo = _ipv4_first_getaddrinfo
@@ -69,7 +73,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("KonGermanBot")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = genai.Client(
+    api_key=GEMINI_API_KEY,
+    http_options=types.HttpOptions(timeout=35000),
+)
 
 # Bộ đệm gom nhiều ảnh gửi cùng lúc (Album / Media Group) để chấm gộp thành 1 bài duy nhất
 MEDIA_GROUP_BUFFER = {}
@@ -91,11 +98,11 @@ AUDIO_MIME_MAP = {
 _MODEL_COOLDOWN_UNTIL = {}
 
 
-async def generate_with_fallback(contents, config=None):
+async def generate_with_fallback(contents, config=None, timeout_sec: float = 35.0):
     """
-    Gọi Gemini API với cơ chế Định tuyến Model Thông minh (Adaptive Model Routing):
-    - Nếu một model gặp lỗi quá tải tạm thời (503 UNAVAILABLE / 429), tạm đưa model đó vào cooldown 10 phút
-      để các yêu cầu tiếp theo gọi thẳng vào model đang khỏe mà không mất thời gian chờ retry.
+    Gọi Gemini API với cơ chế Định tuyến Model Thông minh (Adaptive Model Routing) + Chống treo Timeout:
+    - Nếu một model gặp lỗi quá tải tạm thời (503 / 429) hoặc bị treo quá timeout_sec, lập tức đưa model đó
+      vào cooldown 10 phút và chuyển ngay sang model khỏe tiếp theo.
     """
     import time
     now = time.monotonic()
@@ -105,31 +112,35 @@ async def generate_with_fallback(contents, config=None):
 
     last_error = None
     for model_name in ordered_chain:
-        for attempt in range(2):
-            try:
-                response = await asyncio.to_thread(
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
                     client.models.generate_content,
                     model=model_name,
                     contents=contents,
                     config=config,
-                )
-                if response and response.text:
-                    _MODEL_COOLDOWN_UNTIL.pop(model_name, None)
-                    if model_name != FALLBACK_CHAIN[0]:
-                        logger.info(f"Đã dùng model dự phòng thành công: {model_name}")
-                    return response
-            except Exception as e:
-                last_error = e
-                err_str = str(e)
-                logger.warning(f"Model {model_name} (lần {attempt+1}) gặp lỗi: {err_str[:160]}")
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str or "overloaded" in err_str.lower():
-                    if attempt == 1:
-                        # Đưa model đang quá tải vào cooldown 10 phút (600s)
-                        _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + 600
-                        logger.info(f"Tạm thời chuyển hướng khỏi {model_name} trong 10 phút do quá tải 503.")
-                    await asyncio.sleep(0.6)
-                    continue
-                break
+                ),
+                timeout=timeout_sec,
+            )
+            if response and response.text:
+                _MODEL_COOLDOWN_UNTIL.pop(model_name, None)
+                if model_name != FALLBACK_CHAIN[0]:
+                    logger.info(f"Đã dùng model dự phòng thành công: {model_name}")
+                return response
+        except asyncio.TimeoutError:
+            last_error = TimeoutError(f"Model {model_name} phản hồi quá {timeout_sec}s")
+            _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + 600
+            logger.warning(f"Model {model_name} bị treo quá {timeout_sec}s -> Chuyển ngay sang model dự phòng!")
+            continue
+        except Exception as e:
+            last_error = e
+            err_str = str(e)
+            logger.warning(f"Model {model_name} gặp lỗi: {err_str[:160]}")
+            if any(k in err_str.lower() for k in ("503", "unavailable", "429", "overloaded", "timeout", "timed out")):
+                _MODEL_COOLDOWN_UNTIL[model_name] = time.monotonic() + 600
+                logger.info(f"Tạm thời chuyển hướng khỏi {model_name} trong 10 phút.")
+                continue
+            continue
     raise last_error
 
 

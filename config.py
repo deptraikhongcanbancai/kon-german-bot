@@ -6,17 +6,17 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
-# Danh sách các model dự phòng tự động chuyển đổi tức thì nếu model chính bị quá tải (503 / 429)
+# Danh sách các model dự phòng tự động chuyển đổi tức thì nếu model chính bị quá tải (503 / 429 / Timeout)
 GEMINI_FALLBACK_MODELS = [
     GEMINI_MODEL,
+    "gemini-2.5-flash",
+    "gemini-3-flash-preview",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
-    "gemini-3.5-flash",
-    "gemini-3-flash-preview",
-    "gemini-2.5-flash",
-    "gemini-3.5-flash-lite",
 ]
 # Loại bỏ trùng lặp nhưng giữ nguyên thứ tự ưu tiên
 FALLBACK_CHAIN = list(dict.fromkeys(GEMINI_FALLBACK_MODELS))
