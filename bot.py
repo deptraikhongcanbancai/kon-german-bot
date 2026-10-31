@@ -59,11 +59,16 @@ from services.mtproto_service import download_media_mtproto, prepare_audio_for_g
 from services.auth_service import (
     ADMIN_USER_ID,
     authorize_user,
+    check_daily_quota,
+    consume_daily_quota,
+    get_daily_limit,
     get_passcode,
     is_admin,
     is_user_authorized,
     list_authorized_users,
+    reset_user_quota,
     revoke_user,
+    set_daily_limit,
     set_passcode,
 )
 
@@ -325,9 +330,11 @@ async def check_access_or_unlock(update: Update, context: ContextTypes.DEFAULT_T
 
     if msg_text and msg_text.lower() == current_pass.lower():
         authorize_user(user.id, user.full_name or user.first_name or "Người dùng", user.username or "")
+        daily_limit = get_daily_limit()
         await safe_reply_text(
             update,
-            f"✅ **Mở khóa thành công!** Chào mừng **{user.first_name or 'bạn'}** sử dụng **Kon German Bot** 🤓.\n\n"
+            f"✅ **Mở khóa thành công!** Chào mừng **{user.first_name or 'bạn'}** sử dụng **Kon German Bot** 🤓.\n"
+            f"📊 Hạn mức tài khoản thành viên: **{daily_limit} bài chấm / ngày** (tự động làm mới mỗi ngày).\n\n"
             "Bây giờ bạn có thể gửi trực tiếp:\n"
             "• 🎙️ Video / Ghi âm bài nói tiếng Đức (Sprechen)\n"
             "• 📸 Ảnh chụp bài viết tay (Schreiben B1 Teil 1, 2, 3)\n"
@@ -339,7 +346,7 @@ async def check_access_or_unlock(update: Update, context: ContextTypes.DEFAULT_T
                 chat_id=ADMIN_USER_ID,
                 text=(
                     f"🔔 **Thông báo Admin:** Người dùng **{user.full_name}**{uname} "
-                    f"(ID: `{user.id}`) vừa nhập đúng mật khẩu và được cấp quyền dùng Bot!\n"
+                    f"(ID: `{user.id}`) vừa nhập đúng mật khẩu và được cấp quyền dùng Bot ({daily_limit} bài/ngày)!\n"
                     f"👉 Nếu muốn thu hồi quyền bất kỳ lúc nào, gõ: `/revoke {user.id}`"
                 ),
             )
@@ -356,23 +363,86 @@ async def check_access_or_unlock(update: Update, context: ContextTypes.DEFAULT_T
     return False
 
 
+async def enforce_daily_quota(update: Update, consume: bool = True) -> bool:
+    """
+    Kiểm tra hạn mức chấm bài mỗi ngày (mặc định 10 bài/ngày cho thành viên, Admin không giới hạn).
+    Nếu đã hết lượt trong ngày, chặn ngay trước khi gọi AI để không tốn token.
+    """
+    user = update.effective_user
+    if not user or is_admin(user.id):
+        return True
+
+    allowed, used, limit = check_daily_quota(user.id)
+    if not allowed:
+        today = datetime.now().strftime("%d/%m/%Y")
+        await safe_reply_text(
+            update,
+            f"⏳ **Đã hết lượt chấm bài trong ngày ({used}/{limit} bài)!**\n\n"
+            f"Tài khoản thành viên của bạn đã sử dụng hết **{limit} lượt** trong ngày hôm nay ({today}). "
+            f"Hạn mức sẽ tự động làm mới về `0/{limit}` vào **00:00 ngày mai** (hoặc liên hệ Admin nếu cần cấp thêm lượt nhé 🤓)!"
+        )
+        return False
+
+    if consume:
+        consume_daily_quota(user.id)
+    return True
+
+
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await safe_reply_text(update, "⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
         return
     users = list_authorized_users()
     cur_pass = get_passcode()
+    cur_limit = get_daily_limit()
     lines = [
         f"🔐 **QUẢN LÝ NGƯỜI DÙNG BOT (Tổng: {len(users)} người)**",
         f"🔑 Mật khẩu mở khóa hiện tại: `{cur_pass}`",
-        "*(Đổi mật khẩu bằng lệnh: `/setpass <mật_khẩu_mới>`)*\n",
+        f"📊 Giới hạn thành viên: **{cur_limit} bài / ngày**",
+        "*(Đổi mật khẩu: `/setpass <mã>` | Đổi giới hạn: `/setlimit <số>`)*\n",
     ]
     for uid, info in users.items():
-        role_badge = "👑 Admin" if info.get("role") == "admin" else "👤 Thành viên"
+        is_adm = info.get("role") == "admin"
+        role_badge = "👑 Admin" if is_adm else "👤 Thành viên"
         uname = f" (@{info['username']})" if info.get("username") else ""
-        lines.append(f"• {role_badge}: **{info.get('name')}**{uname} — ID: `{uid}` (Từ: {info.get('joined_at', '')})")
-    lines.append("\n💡 *Để xóa quyền 1 người, gõ:* `/revoke <ID>`")
+        quota_str = "Không giới hạn (∞)" if is_adm else f"Hôm nay: {info.get('usage_count', 0)}/{cur_limit} bài"
+        lines.append(
+            f"• {role_badge}: **{info.get('name')}**{uname} — ID: `{uid}` — **{quota_str}**"
+        )
+    lines.append("\n💡 *Lệnh nhanh cho Admin:*")
+    lines.append("• `/resetquota <ID>` — Reset lượt chấm hôm nay của 1 người về 0")
+    lines.append("• `/revoke <ID>` — Thu hồi quyền sử dụng của 1 người")
     await safe_reply_text(update, "\n".join(lines))
+
+
+async def setlimit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await safe_reply_text(update, "⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
+        return
+    if not context.args or not context.args[0].strip().isdigit():
+        await safe_reply_text(
+            update,
+            f"📊 Giới hạn hiện tại cho mỗi thành viên là: **{get_daily_limit()} bài / ngày**.\n"
+            "Để thay đổi, hãy gõ: `/setlimit <số_bài>` (VD: `/setlimit 10`)"
+        )
+        return
+    new_limit = int(context.args[0].strip())
+    set_daily_limit(new_limit)
+    await safe_reply_text(update, f"✅ Đã cập nhật hạn mức thành viên thành: **{new_limit} bài / ngày**!")
+
+
+async def resetquota_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await safe_reply_text(update, "⛔ Lệnh này chỉ dành riêng cho Admin của Bot!")
+        return
+    if not context.args or not context.args[0].strip().isdigit():
+        await safe_reply_text(update, "⚠️ Vui lòng nhập ID thành viên cần reset lượt chấm. VD: `/resetquota 123456789`")
+        return
+    target_id = int(context.args[0].strip())
+    if reset_user_quota(target_id):
+        await safe_reply_text(update, f"✅ Đã làm mới lượt chấm hôm nay của ID `{target_id}` về **0/{get_daily_limit()}**!")
+    else:
+        await safe_reply_text(update, f"⚠️ Không tìm thấy thành viên mang ID `{target_id}`.")
 
 
 async def setpass_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -513,6 +583,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = (update.message.text or "").strip()
     if not user_text:
         return
+    if not await enforce_daily_quota(update, consume=True):
+        return
 
     await safe_send_action(update, action=ChatAction.TYPING)
     user_name = user.first_name or "Ông chủ"
@@ -626,6 +698,8 @@ async def process_speaking_audio(update: Update, audio_path: Path, mime_type: st
 async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access_or_unlock(update, context):
         return
+    if not await enforce_daily_quota(update, consume=True):
+        return
     caption = (update.message.caption or "").strip()
     voice = update.message.voice
     audio = update.message.audio
@@ -693,6 +767,14 @@ async def handle_voice_or_audio(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def process_handwriting_images(update: Update, image_paths: list[Path], caption: str = ""):
+    if not await enforce_daily_quota(update, consume=True):
+        for p in image_paths:
+            try:
+                if p and p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        return
     user = update.effective_user
     user_name = user.first_name or "Ông chủ"
     await safe_send_action(update, action=ChatAction.TYPING)
@@ -788,6 +870,8 @@ async def _flush_media_group(media_group_id: str):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access_or_unlock(update, context):
         return
+    if not await enforce_daily_quota(update, consume=False):
+        return
     photo = update.message.photo[-1]
     caption = (update.message.caption or "").strip()
     media_group_id = update.message.media_group_id
@@ -813,6 +897,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access_or_unlock(update, context):
+        return
+    if not await enforce_daily_quota(update, consume=False):
         return
     doc = update.message.document
     if not doc:
@@ -854,10 +940,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if suffix in AUDIO_MIME_MAP:
+            if not await enforce_daily_quota(update, consume=True):
+                return
             await process_speaking_audio(update, temp_path, mime_type=AUDIO_MIME_MAP[suffix], caption=caption)
             return
 
         if suffix == ".docx":
+            if not await enforce_daily_quota(update, consume=True):
+                return
             await safe_send_action(update, action=ChatAction.TYPING)
             extracted_text = await asyncio.to_thread(read_docx_text, temp_path)
             if not extracted_text:
@@ -989,6 +1079,8 @@ def main():
     app.add_handler(CommandHandler("clear", clear_cmd))
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("setpass", setpass_cmd))
+    app.add_handler(CommandHandler("setlimit", setlimit_cmd))
+    app.add_handler(CommandHandler("resetquota", resetquota_cmd))
     app.add_handler(CommandHandler("revoke", revoke_cmd))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE | filters.VIDEO, handle_voice_or_audio))
